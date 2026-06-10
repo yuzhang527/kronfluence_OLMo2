@@ -1,0 +1,7 @@
+# 忽略所有
+*
+
+# 但允许以下文件夹（及其所有内容）
+!kronfluence/
+!scripts/
+!.gitignore
