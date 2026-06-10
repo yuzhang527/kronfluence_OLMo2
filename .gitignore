@@ -1,4 +1,6 @@
-*
-!/.gitignore
-!/kronfluence/
-!/scripts/
+﻿*
+!.gitignore
+!kronfluence/
+!kronfluence/*
+!scripts/
+!scripts/*
