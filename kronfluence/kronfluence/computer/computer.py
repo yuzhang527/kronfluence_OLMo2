@@ -21,7 +21,9 @@ from kronfluence.factor.eigen import (
     eigendecomposition_exist,
     lambda_matrices_exist,
     load_eigendecomposition,
+    load_eigendecomposition_for_modules as _load_eigendecomposition_for_modules,
     load_lambda_matrices,
+    load_lambda_matrices_for_modules as _load_lambda_matrices_for_modules,
 )
 from kronfluence.module.tracked_module import ModuleMode
 from kronfluence.module.utils import (
@@ -361,6 +363,113 @@ class Computer(ABC):
         if not lambda_matrices_exist(output_dir=factors_output_dir):
             return None
         return load_lambda_matrices(output_dir=factors_output_dir)
+
+
+    def load_eigendecomposition_for_modules(
+        self,
+        factors_name: str,
+        module_names: Sequence[str],
+    ) -> Optional[FACTOR_TYPE]:
+        """Load eigendecomposition tensors for only the requested modules."""
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+
+        if not eigendecomposition_exist(output_dir=factors_output_dir):
+            return None
+
+        return _load_eigendecomposition_for_modules(
+            output_dir=factors_output_dir,
+            module_names=module_names,
+        )
+
+    def load_lambda_matrices_for_modules(
+        self,
+        factors_name: str,
+        module_names: Sequence[str],
+    ) -> Optional[FACTOR_TYPE]:
+        """Load Lambda tensors for only the requested modules."""
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+
+        if not lambda_matrices_exist(output_dir=factors_output_dir):
+            return None
+
+        return _load_lambda_matrices_for_modules(
+            output_dir=factors_output_dir,
+            module_names=module_names,
+        )
+
+    def load_all_factors_for_modules(
+        self,
+        factors_name: str,
+        module_names: Sequence[str],
+    ) -> FACTOR_TYPE:
+        """Load preconditioning factors for specified tracked modules only.
+
+        EKFAC uses this method to avoid materializing unrelated eigen and
+        Lambda tensors before a module partition is processed. Strategies that
+        require covariance for preconditioning keep the existing full
+        covariance loader for compatibility.
+        """
+        from kronfluence.factor.config import (  # pylint: disable=import-outside-toplevel
+            FactorConfig,
+        )
+
+        factor_args = self.load_factor_args(factors_name=factors_name)
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+
+        if factor_args is None:
+            error_msg = (
+                f"Factors with name `{factors_name}` was not found at "
+                f"`{factors_output_dir}`."
+            )
+            self.logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+
+        loaded_factors: FACTOR_TYPE = {}
+        factor_config = FactorConfig.CONFIGS[factor_args.strategy]
+
+        if factor_config.requires_covariance_matrices_for_precondition:
+            covariance_factors = self.load_covariance_matrices(
+                factors_name=factors_name
+            )
+            if covariance_factors is None:
+                error_msg = (
+                    f"Strategy `{factor_args.strategy}` requires covariance "
+                    "matrices. However, the covariance matrices were not found."
+                )
+                self.logger.error(error_msg)
+                raise FactorsNotFoundError(error_msg)
+            loaded_factors.update(covariance_factors)
+
+        if factor_config.requires_eigendecomposition_for_precondition:
+            eigen_factors = self.load_eigendecomposition_for_modules(
+                factors_name=factors_name,
+                module_names=module_names,
+            )
+            if eigen_factors is None:
+                error_msg = (
+                    f"Strategy `{factor_args.strategy}` requires "
+                    "Eigendecomposition results. However, the Eigendecomposition "
+                    "results were not found."
+                )
+                self.logger.error(error_msg)
+                raise FactorsNotFoundError(error_msg)
+            loaded_factors.update(eigen_factors)
+
+        if factor_config.requires_lambda_matrices_for_precondition:
+            lambda_factors = self.load_lambda_matrices_for_modules(
+                factors_name=factors_name,
+                module_names=module_names,
+            )
+            if lambda_factors is None:
+                error_msg = (
+                    f"Strategy `{factor_args.strategy}` requires Lambda "
+                    "matrices. However, the Lambda matrices were not found."
+                )
+                self.logger.error(error_msg)
+                raise FactorsNotFoundError(error_msg)
+            loaded_factors.update(lambda_factors)
+
+        return loaded_factors
 
     def load_score_args(self, scores_name: str) -> Optional[ScoreArguments]:
         """Loads score arguments with the given score name."""
