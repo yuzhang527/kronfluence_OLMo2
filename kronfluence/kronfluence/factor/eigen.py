@@ -1,10 +1,11 @@
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 from accelerate.utils import find_batch_size, send_to_device
 from accelerate.utils.memory import should_reduce_batch_size
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import autocast, nn
 from torch.cuda.amp import GradScaler
@@ -111,6 +112,62 @@ def load_eigendecomposition(
             factor_name=factor_name,
         )
         eigen_factors[factor_name] = load_file(filename=save_path)
+    return eigen_factors
+
+
+
+def _load_selected_module_tensors(
+    save_path: Path,
+    module_names: Sequence[str],
+) -> Dict[str, torch.Tensor]:
+    """Load only specified module tensors from one safetensors factor file.
+
+    This avoids eager materialization of every module key in the file. It is
+    intended for module-partitioned EKFAC lambda and score computation.
+    """
+    requested_module_names = list(dict.fromkeys(module_names))
+
+    if not requested_module_names:
+        return {}
+
+    with safe_open(str(save_path), framework="pt", device="cpu") as handle:
+        available_module_names = set(handle.keys())
+
+        missing_module_names = [
+            module_name
+            for module_name in requested_module_names
+            if module_name not in available_module_names
+        ]
+        if missing_module_names:
+            preview = ", ".join(missing_module_names[:5])
+            raise KeyError(
+                f"Factor file `{save_path}` does not contain requested module "
+                f"tensor key(s): {preview}"
+            )
+
+        return {
+            module_name: handle.get_tensor(module_name)
+            for module_name in requested_module_names
+        }
+
+
+def load_eigendecomposition_for_modules(
+    output_dir: Path,
+    module_names: Sequence[str],
+) -> FACTOR_TYPE:
+    """Load eigendecomposition factors only for selected modules."""
+    eigen_factors: FACTOR_TYPE = {}
+
+    for factor_name in EIGENDECOMPOSITION_FACTOR_NAMES:
+        save_path = eigendecomposition_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+        )
+        eigen_factors[factor_name] = _load_selected_module_tensors(
+            save_path=save_path,
+            module_names=module_names,
+        )
+
     return eigen_factors
 
 
@@ -315,6 +372,29 @@ def load_lambda_matrices(
             partition=partition,
         )
         lambda_factors[factor_name] = load_file(filename=save_path)
+    return lambda_factors
+
+
+
+def load_lambda_matrices_for_modules(
+    output_dir: Path,
+    module_names: Sequence[str],
+    partition: Optional[PARTITION_TYPE] = None,
+) -> FACTOR_TYPE:
+    """Load Lambda factors only for selected modules."""
+    lambda_factors: FACTOR_TYPE = {}
+
+    for factor_name in LAMBDA_FACTOR_NAMES:
+        save_path = lambda_matrices_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+            partition=partition,
+        )
+        lambda_factors[factor_name] = _load_selected_module_tensors(
+            save_path=save_path,
+            module_names=module_names,
+        )
+
     return lambda_factors
 
 
