@@ -191,6 +191,7 @@ def compute_pairwise_scores_with_loaders(
                 factor_name=name,
                 factors=loaded_factors[name],
                 clone=True,
+                tracked_module_names=tracked_module_names,
             )
     prepare_modules(model=model, tracked_module_names=tracked_module_names, device=state.device)
 
@@ -321,7 +322,13 @@ def compute_pairwise_query_aggregated_scores_with_loaders(
     )
     if len(loaded_factors) > 0:
         for name in loaded_factors:
-            set_factors(model=model, factor_name=name, factors=loaded_factors[name], clone=True)
+            set_factors(
+                model=model,
+                factor_name=name,
+                factors=loaded_factors[name],
+                clone=True,
+                tracked_module_names=tracked_module_names,
+            )
     prepare_modules(model=model, tracked_module_names=tracked_module_names, device=state.device)
 
     enable_amp = score_args.amp_dtype is not None

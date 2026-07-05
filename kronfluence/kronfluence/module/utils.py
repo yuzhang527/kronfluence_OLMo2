@@ -235,7 +235,13 @@ def load_factors(
     return loaded_factors
 
 
-def set_factors(model: nn.Module, factor_name: str, factors: Dict[str, torch.Tensor], clone: bool = False) -> None:
+def set_factors(
+    model: nn.Module,
+    factor_name: str,
+    factors: Dict[str, torch.Tensor],
+    clone: bool = False,
+    tracked_module_names: Optional[List[str]] = None,
+) -> None:
     """Sets new factors for all `TrackedModule` instances within a model.
 
     Args:
@@ -250,8 +256,18 @@ def set_factors(model: nn.Module, factor_name: str, factors: Dict[str, torch.Ten
     """
     for module in model.modules():
         if isinstance(module, TrackedModule):
+            if tracked_module_names is not None and module.name not in tracked_module_names:
+                continue
+
+            if module.name not in factors:
+                raise KeyError(
+                    f"Factor `{factor_name}` is missing for tracked module "
+                    f"`{module.name}`."
+                )
+
             module.set_factor(
-                factor_name=factor_name, factor=factors[module.name].clone() if clone else factors[module.name]
+                factor_name=factor_name,
+                factor=factors[module.name].clone() if clone else factors[module.name],
             )
 
 
