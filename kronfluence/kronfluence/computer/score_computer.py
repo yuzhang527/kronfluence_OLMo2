@@ -332,11 +332,6 @@ class ScoreComputer(Computer):
             train_dataset = data.Subset(dataset=train_dataset, indices=train_indices)
             del train_indices
 
-        with self.profiler.profile("Load All Factors"):
-            loaded_factors = self.load_all_factors(
-                factors_name=factors_name,
-            )
-
         no_partition = score_args.data_partitions == 1 and score_args.module_partitions == 1
         partition_provided = target_data_partitions is not None or target_module_partitions is not None
         if no_partition and partition_provided:
@@ -384,6 +379,14 @@ class ScoreComputer(Computer):
                     f"Computing pairwise scores with data indices ({start_index}, {end_index}) and "
                     f"modules {module_partition_names[module_partition]}."
                 )
+
+                # Keep DDP data parallelism unchanged, but only materialize
+                # factors for the current module partition on each rank.
+                with self.profiler.profile("Load Factors For Module Partition"):
+                    loaded_factors = self.load_all_factors_for_modules(
+                        factors_name=factors_name,
+                        module_names=module_partition_names[module_partition],
+                    )
 
                 if per_device_train_batch_size is None:
                     per_device_train_batch_size = self._find_executable_pairwise_scores_batch_size(
@@ -449,7 +452,7 @@ class ScoreComputer(Computer):
                             metadata=score_args.to_str_dict(),
                         )
                     self.state.wait_for_everyone()
-                del scores, query_loader, train_loader
+                del scores, query_loader, train_loader, loaded_factors
                 self._reset_memory()
                 self.logger.info(f"Saved pairwise scores at {scores_output_dir}.")
 
