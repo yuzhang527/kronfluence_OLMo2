@@ -1,0 +1,2305 @@
+
+==============================================================================================================
+FactorComputer.fit_covariance_matrices
+==============================================================================================================
+    def fit_covariance_matrices(
+        self,
+        factors_name: str,
+        dataset: data.Dataset,
+        per_device_batch_size: Optional[int] = None,
+        initial_per_device_batch_size_attempt: int = 4096,
+        dataloader_kwargs: Optional[DataLoaderKwargs] = None,
+        factor_args: Optional[FactorArguments] = None,
+        target_data_partitions: Optional[Union[Sequence[int], int]] = None,
+        target_module_partitions: Optional[Union[Sequence[int], int]] = None,
+        overwrite_output_dir: bool = False,
+    ) -> None:
+        """Computes activation and pseudo-covariance matrices with the given dataset.
+
+        Args:
+            factors_name (str):
+                The unique identifier for the factor, used to organize and retrieve the results.
+            dataset (data.Dataset):
+                The dataset that will be used for fitting covariance matrices.
+            per_device_batch_size (int, optional):
+                The per-device batch size used to fit the factors. If not specified, executable
+                batch size is automatically determined.
+            initial_per_device_batch_size_attempt (int, optional):
+                The initial attempted per-device batch size when the batch size is not provided.
+            dataloader_kwargs (DataLoaderKwargs, optional):
+                Controls additional arguments for PyTorch's DataLoader.
+            factor_args (FactorArguments, optional):
+                Arguments for factor computation.
+            target_data_partitions(Sequence[int], int, optional):
+                The list of data partition to fit covariance matrices. By default, covariance
+                matrices will be computed for all partitions.
+            target_module_partitions(Sequence[int], int, optional):
+                The list of module partition to fit covariance matrices. By default, covariance
+                matrices will be computed for all partitions.
+            overwrite_output_dir (bool, optional):
+                Whether to overwrite existing output.
+        """
+        self.logger.debug(f"Fitting covariance matrices with parameters: {locals()}")
+
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+        os.makedirs(factors_output_dir, exist_ok=True)
+        if covariance_matrices_exist(output_dir=factors_output_dir) and not overwrite_output_dir:
+            self.logger.info(f"Found existing covariance matrices at `{factors_output_dir}`. Skipping.")
+            return
+
+        factor_args = self._configure_and_save_factor_args(
+            factor_args=factor_args, factors_output_dir=factors_output_dir, overwrite_output_dir=overwrite_output_dir
+        )
+
+        if not FactorConfig.CONFIGS[factor_args.strategy].requires_covariance_matrices:
+            self.logger.info(
+                f"Strategy `{factor_args.strategy}` does not require fitting covariance matrices. Skipping."
+            )
+            return
+
+        dataloader_params = self._configure_dataloader(dataloader_kwargs)
+        if self.state.is_main_process:
+            self._save_dataset_metadata(
+                dataset_name="covariance",
+                dataset=dataset,
+                output_dir=factors_output_dir,
+                overwrite_output_dir=overwrite_output_dir,
+            )
+
+        if factor_args.covariance_max_examples is None:
+            total_data_examples = len(dataset)
+        else:
+            total_data_examples = min([factor_args.covariance_max_examples, len(dataset)])
+        self.logger.info(f"Total data examples to fit covariance matrices: {total_data_examples}.")
+
+        no_partition = factor_args.covariance_data_partitions == 1 and factor_args.covariance_module_partitions == 1
+        partition_provided = target_data_partitions is not None or target_module_partitions is not None
+        if no_partition and partition_provided:
+            error_msg = (
+                "`target_data_partitions` or `target_module_partitions` were specified, while"
+                "the `FactorArguments` did not expect any data and module partition to compute covariance matrices."
+            )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        data_partition_indices, target_data_partitions = self._get_data_partition(
+            total_data_examples=total_data_examples,
+            data_partitions=factor_args.covariance_data_partitions,
+            target_data_partitions=target_data_partitions,
+        )
+        max_partition_examples = total_data_examples // factor_args.covariance_data_partitions
+        module_partition_names, target_module_partitions = self._get_module_partition(
+            module_partitions=factor_args.covariance_module_partitions,
+            target_module_partitions=target_module_partitions,
+        )
+
+        if max_partition_examples < self.state.num_processes:
+            error_msg = "The number of processes are larger than total data examples. Try reducing number of processes."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        all_start_time = get_time(state=self.state)
+        for data_partition in target_data_partitions:
+            for module_partition in target_module_partitions:
+                if no_partition:
+                    partition = None
+                else:
+                    partition = (data_partition, module_partition)
+
+                if (
+                    covariance_matrices_exist(
+                        output_dir=factors_output_dir,
+                        partition=partition,
+                    )
+                    and not overwrite_output_dir
+                ):
+                    self.logger.info(
+                        f"Found existing covariance matrices for data partition {data_partition} "
+                        f"and module partition {module_partition} at {factors_output_dir}. Skipping."
+                    )
+                    continue
+
+                start_index, end_index = data_partition_indices[data_partition]
+                self.logger.info(
+                    f"Fitting covariance matrices with data indices ({start_index}, {end_index}) and "
+                    f"modules {module_partition_names[module_partition]}."
+                )
+
+                if per_device_batch_size is None:
+                    kwargs = {
+                        "model": self.model,
+                        "state": self.state,
+                        "task": self.task,
+                        "factor_args": factor_args,
+                        "tracked_module_names": module_partition_names[module_partition],
+                        "disable_tqdm": True,
+                    }
+                    per_device_batch_size = self._find_executable_factors_batch_size(
+                        func=fit_covariance_matrices_with_loader,
+                        func_kwargs=kwargs,
+                        dataset=dataset,
+                        initial_per_device_batch_size_attempt=initial_per_device_batch_size_attempt,
+                        dataloader_params=dataloader_params,
+                        total_data_examples=max_partition_examples,
+                    )
+
+                self._reset_memory()
+                start_time = get_time(state=self.state)
+                with self.profiler.profile("Fit Covariance"):
+                    loader = self._get_dataloader(
+                        dataset=dataset,
+                        per_device_batch_size=per_device_batch_size,
+                        dataloader_params=dataloader_params,
+                        indices=list(range(start_index, end_index)),
+                        allow_duplicates=False,
+                    )
+                    num_data_processed, covariance_factors = fit_covariance_matrices_with_loader(
+                        model=self.model,
+                        state=self.state,
+                        task=self.task,
+                        loader=loader,
+                        factor_args=factor_args,
+                        tracked_module_names=module_partition_names[module_partition],
+                        disable_tqdm=self.disable_tqdm,
+                    )
+                end_time = get_time(state=self.state)
+                elapsed_time = end_time - start_time
+                self.logger.info(
+                    f"Fitted covariance matrices with {num_data_processed.item()} data points in "
+                    f"{elapsed_time:.2f} seconds."
+                )
+
+                with self.profiler.profile("Save Covariance"):
+                    if self.state.is_main_process:
+                        save_covariance_matrices(
+                            output_dir=factors_output_dir,
+                            factors=covariance_factors,
+                            partition=partition,
+                            metadata=factor_args.to_str_dict(),
+                        )
+                    self.state.wait_for_everyone()
+                self.logger.info(f"Saved covariance matrices at `{factors_output_dir}`.")
+                del num_data_processed, covariance_factors, loader
+                self._reset_memory()
+
+        all_end_time = get_time(state=self.state)
+        elapsed_time = all_end_time - all_start_time
+        if not no_partition:
+            self.logger.info(f"Fitted all partitioned covariance matrices in {elapsed_time:.2f} seconds.")
+            if self.state.is_main_process:
+                self.aggregate_covariance_matrices(factors_name=factors_name)
+                self.logger.info(f"Saved aggregated covariance matrices at `{factors_output_dir}`.")
+            self.state.wait_for_everyone()
+        self._log_profile_summary(name=f"factors_{factors_name}_covariance")
+
+
+==============================================================================================================
+FactorComputer.perform_eigendecomposition
+==============================================================================================================
+    def perform_eigendecomposition(
+        self,
+        factors_name: str,
+        factor_args: Optional[FactorArguments] = None,
+        overwrite_output_dir: bool = False,
+        load_from_factors_name: Optional[str] = None,
+    ) -> None:
+        """Performs eigendecomposition on all covariance matrices.
+
+        Args:
+            factors_name (str):
+                The unique identifier for the factor, used to organize and retrieve the results.
+            factor_args (FactorArguments, optional):
+                Arguments for factor computation.
+            overwrite_output_dir (bool, optional):
+                Whether to overwrite existing output.
+            load_from_factors_name (str, optional):
+                The `factor_name` to load covariance matrices from. By default, covariance matrices with
+                the same `factor_name` will be used.
+        """
+        self.logger.debug(f"Performing eigendecomposition with parameters: {locals()}")
+
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+        os.makedirs(factors_output_dir, exist_ok=True)
+        if eigendecomposition_exist(output_dir=factors_output_dir) and not overwrite_output_dir:
+            self.logger.info(f"Found existing eigendecomposition results at `{factors_output_dir}`. Skipping.")
+            return
+
+        factor_args = self._configure_and_save_factor_args(
+            factor_args=factor_args, factors_output_dir=factors_output_dir, overwrite_output_dir=overwrite_output_dir
+        )
+
+        if not FactorConfig.CONFIGS[factor_args.strategy].requires_eigendecomposition:
+            self.logger.info(
+                f"Strategy `{factor_args.strategy}` does not require performing eigendecomposition. Skipping."
+            )
+            return None
+
+        load_factors_output_dir = factors_output_dir
+        if load_from_factors_name is not None:
+            self.logger.info(f"Will be loading covariance matrices from factors with name `{load_from_factors_name}`.")
+            load_factors_output_dir = self.factors_output_dir(factors_name=load_from_factors_name)
+
+        if not covariance_matrices_exist(output_dir=load_factors_output_dir):
+            error_msg = (
+                f"Covariance matrices not found at `{load_factors_output_dir}`. "
+                f"To perform eigendecomposition, covariance matrices need to be first computed."
+            )
+            self.logger.error(error_msg)
+            raise FactorsNotFoundError(error_msg)
+
+        with self.profiler.profile("Load Covariance"):
+            covariance_factors = load_covariance_matrices(output_dir=load_factors_output_dir)
+
+        if load_from_factors_name is not None and self.state.is_main_process:
+            # Save the loaded covariances to the current factor output directory.
+            with self.profiler.profile("Save Covariance"):
+                save_covariance_matrices(output_dir=factors_output_dir, factors=covariance_factors)
+            loaded_factor_args = self.load_factor_args(factors_name=load_from_factors_name)
+            self._save_arguments(
+                arguments_name=FACTOR_ARGUMENTS_NAME + "_loaded_covariance",
+                arguments=loaded_factor_args,
+                output_dir=factors_output_dir,
+                overwrite_output_dir=True,
+            )
+        self.state.wait_for_everyone()
+
+        self._reset_memory()
+        eigen_factors = None
+        if self.state.is_main_process:
+            start_time = time.time()
+            with self.profiler.profile("Perform Eigendecomposition"):
+                eigen_factors = perform_eigendecomposition(
+                    covariance_factors=covariance_factors,
+                    model=self.model,
+                    state=self.state,
+                    factor_args=factor_args,
+                    disable_tqdm=self.disable_tqdm,
+                )
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            self.logger.info(f"Performed eigendecomposition in {elapsed_time:.2f} seconds.")
+
+            with self.profiler.profile("Save Eigendecomposition"):
+                save_eigendecomposition(
+                    output_dir=factors_output_dir, factors=eigen_factors, metadata=factor_args.to_str_dict()
+                )
+            self.logger.info(f"Saved eigendecomposition results at `{factors_output_dir}`.")
+            del eigen_factors
+            self._reset_memory()
+        self.state.wait_for_everyone()
+        self._log_profile_summary(name=f"factors_{factors_name}_eigendecomposition")
+
+
+==============================================================================================================
+FactorComputer.fit_lambda_matrices
+==============================================================================================================
+    def fit_lambda_matrices(
+        self,
+        factors_name: str,
+        dataset: data.Dataset,
+        per_device_batch_size: Optional[int] = None,
+        initial_per_device_batch_size_attempt: int = 4096,
+        dataloader_kwargs: Optional[DataLoaderKwargs] = None,
+        factor_args: Optional[FactorArguments] = None,
+        target_data_partitions: Optional[Union[Sequence[int], int]] = None,
+        target_module_partitions: Optional[Union[Sequence[int], int]] = None,
+        overwrite_output_dir: bool = False,
+        load_from_factors_name: Optional[str] = None,
+    ) -> None:
+        """Computes Lambda (corrected-eigenvalues) matrices with the given dataset.
+
+        Args:
+            factors_name (str):
+                The unique identifier for the factor, used to organize and retrieve the results.
+            dataset (data.Dataset):
+                The dataset that will be used for fitting Lambda matrices.
+            per_device_batch_size (int, optional):
+                The per-device batch size used to fit the factors. If not specified, executable
+                batch size is automatically determined.
+            initial_per_device_batch_size_attempt (int, optional):
+                The initial attempted per-device batch size when the batch size is not provided.
+            dataloader_kwargs (DataLoaderKwargs, optional):
+                Controls additional arguments for PyTorch's DataLoader.
+            factor_args (FactorArguments, optional):
+                Arguments for factor computation.
+            target_data_partitions(Sequence[int], int, optional):
+                The list of data partition to fit Lambda matrices. By default, Lambda
+                matrices will be computed for all partitions.
+            target_module_partitions(Sequence[int], int, optional):
+                The list of module partition to fit Lambda matrices. By default, Lambda
+                matrices will be computed for all partitions.
+            overwrite_output_dir (bool, optional):
+                Whether to overwrite existing output.
+            load_from_factors_name (str, optional):
+                The `factor_name` to load eigendecomposition results from. By default, eigendecomposition
+                results with the same `factor_name` will be used.
+        """
+        self.logger.debug(f"Fitting Lambda matrices with parameters: {locals()}")
+
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+        os.makedirs(factors_output_dir, exist_ok=True)
+        if lambda_matrices_exist(output_dir=factors_output_dir) and not overwrite_output_dir:
+            self.logger.info(f"Found existing Lambda matrices at `{factors_output_dir}`. Skipping.")
+            return
+
+        factor_args = self._configure_and_save_factor_args(
+            factor_args=factor_args, factors_output_dir=factors_output_dir, overwrite_output_dir=overwrite_output_dir
+        )
+
+        if not FactorConfig.CONFIGS[factor_args.strategy].requires_lambda_matrices:
+            self.logger.info(f"Strategy `{factor_args.strategy}` does not require fitting Lambda matrices. Skipping.")
+            return
+
+        dataloader_params = self._configure_dataloader(dataloader_kwargs)
+        if self.state.is_main_process:
+            self._save_dataset_metadata(
+                dataset_name="lambda",
+                dataset=dataset,
+                output_dir=factors_output_dir,
+                overwrite_output_dir=overwrite_output_dir,
+            )
+
+        if load_from_factors_name is not None:
+            self.logger.info(
+                f"Will be loading eigendecomposition results from factors with name `{load_from_factors_name}`."
+            )
+            load_factors_output_dir = self.factors_output_dir(factors_name=load_from_factors_name)
+        else:
+            load_factors_output_dir = factors_output_dir
+
+        if (
+            not eigendecomposition_exist(output_dir=load_factors_output_dir)
+            and FactorConfig.CONFIGS[factor_args.strategy].requires_eigendecomposition_for_lambda
+        ):
+            error_msg = (
+                f"Eigendecomposition results not found at `{load_factors_output_dir}`. "
+                f"To fit Lambda matrices for `{factor_args.strategy}`, eigendecomposition must be "
+                f"performed before computing Lambda matrices."
+            )
+            self.logger.error(error_msg)
+            raise FactorsNotFoundError(error_msg)
+
+        eigen_factors = None
+        if FactorConfig.CONFIGS[factor_args.strategy].requires_eigendecomposition_for_lambda:
+            with self.profiler.profile("Load Eigendecomposition"):
+                eigen_factors = load_eigendecomposition(output_dir=load_factors_output_dir)
+            if load_from_factors_name is not None and self.state.is_main_process:
+                with self.profiler.profile("Save Eigendecomposition"):
+                    save_eigendecomposition(output_dir=factors_output_dir, factors=eigen_factors)
+                loaded_factor_args = self.load_factor_args(factors_name=load_from_factors_name)
+                self._save_arguments(
+                    arguments_name=FACTOR_ARGUMENTS_NAME + "_loaded_eigendecomposition",
+                    arguments=loaded_factor_args,
+                    output_dir=factors_output_dir,
+                    overwrite_output_dir=True,
+                )
+            self.state.wait_for_everyone()
+
+        if factor_args.lambda_max_examples is None:
+            total_data_examples = len(dataset)
+        else:
+            total_data_examples = min([factor_args.lambda_max_examples, len(dataset)])
+        self.logger.info(f"Total data examples to fit Lambda matrices: {total_data_examples}.")
+
+        no_partition = factor_args.lambda_data_partitions == 1 and factor_args.lambda_module_partitions == 1
+        partition_provided = target_data_partitions is not None or target_module_partitions is not None
+        if no_partition and partition_provided:
+            error_msg = (
+                "`target_data_partitions` or `target_module_partitions` were specified, while"
+                "the `FactorArguments` did not expect any data and module partition to compute Lambda matrices."
+            )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        data_partition_indices, target_data_partitions = self._get_data_partition(
+            total_data_examples=total_data_examples,
+            data_partitions=factor_args.lambda_data_partitions,
+            target_data_partitions=target_data_partitions,
+        )
+        max_partition_examples = total_data_examples // factor_args.lambda_data_partitions
+        module_partition_names, target_module_partitions = self._get_module_partition(
+            module_partitions=factor_args.lambda_module_partitions,
+            target_module_partitions=target_module_partitions,
+        )
+
+        if max_partition_examples < self.state.num_processes:
+            error_msg = "The number of processes are larger than total data examples. Try reducing number of processes."
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        all_start_time = get_time(state=self.state)
+        for data_partition in target_data_partitions:
+            for module_partition in target_module_partitions:
+                if no_partition:
+                    partition = None
+                else:
+                    partition = (data_partition, module_partition)
+
+                if (
+                    lambda_matrices_exist(
+                        output_dir=factors_output_dir,
+                        partition=partition,
+                    )
+                    and not overwrite_output_dir
+                ):
+                    self.logger.info(
+                        f"Found existing Lambda matrices for data partition {data_partition} "
+                        f"and module partition {module_partition} at {factors_output_dir}. Skipping."
+                    )
+                    continue
+
+                start_index, end_index = data_partition_indices[data_partition]
+                self.logger.info(
+                    f"Fitting Lambda matrices with data indices ({start_index}, {end_index}) and "
+                    f"modules {module_partition_names[module_partition]}."
+                )
+
+                if per_device_batch_size is None:
+                    kwargs = {
+                        "eigen_factors": eigen_factors,
+                        "model": self.model,
+                        "state": self.state,
+                        "task": self.task,
+                        "factor_args": factor_args,
+                        "tracked_module_names": module_partition_names[module_partition],
+                        "disable_tqdm": True,
+                    }
+                    per_device_batch_size = self._find_executable_factors_batch_size(
+                        func=fit_lambda_matrices_with_loader,
+                        func_kwargs=kwargs,
+                        dataset=dataset,
+                        initial_per_device_batch_size_attempt=initial_per_device_batch_size_attempt,
+                        dataloader_params=dataloader_params,
+                        total_data_examples=max_partition_examples,
+                    )
+
+                self._reset_memory()
+                start_time = get_time(state=self.state)
+                with self.profiler.profile("Fit Lambda"):
+                    loader = self._get_dataloader(
+                        dataset=dataset,
+                        per_device_batch_size=per_device_batch_size,
+                        dataloader_params=dataloader_params,
+                        indices=list(range(start_index, end_index)),
+                        allow_duplicates=False,
+                    )
+                    num_data_processed, lambda_factors = fit_lambda_matrices_with_loader(
+                        eigen_factors=eigen_factors,
+                        model=self.model,
+                        state=self.state,
+                        task=self.task,
+                        loader=loader,
+                        factor_args=factor_args,
+                        tracked_module_names=module_partition_names[module_partition],
+                        disable_tqdm=self.disable_tqdm,
+                    )
+                end_time = get_time(state=self.state)
+                elapsed_time = end_time - start_time
+                self.logger.info(
+                    f"Fitted Lambda matrices with {num_data_processed.item()} data points in "
+                    f"{elapsed_time:.2f} seconds."
+                )
+
+                with self.profiler.profile("Save Lambda"):
+                    if self.state.is_main_process:
+                        save_lambda_matrices(
+                            output_dir=factors_output_dir,
+                            factors=lambda_factors,
+                            partition=partition,
+                            metadata=factor_args.to_str_dict(),
+                        )
+                    self.state.wait_for_everyone()
+                self.logger.info(f"Saved Lambda matrices at `{factors_output_dir}`.")
+                del num_data_processed, lambda_factors, loader
+                self._reset_memory()
+
+        all_end_time = get_time(state=self.state)
+        elapsed_time = all_end_time - all_start_time
+        if not no_partition:
+            self.logger.info(f"Fitted all partitioned Lambda matrices in {elapsed_time:.2f} seconds.")
+            if self.state.is_main_process:
+                self.aggregate_lambda_matrices(factors_name=factors_name)
+                self.logger.info(f"Saved aggregated Lambda matrices at `{factors_output_dir}`.")
+            self.state.wait_for_everyone()
+        self._log_profile_summary(name=f"factors_{factors_name}_lambda")
+
+
+==============================================================================================================
+FactorComputer._aggregate_factors
+==============================================================================================================
+    @torch.no_grad()
+    def _aggregate_factors(
+        self,
+        factors_name: str,
+        data_partitions: int,
+        module_partitions: int,
+        exist_fnc: Callable,
+        load_fnc: Callable,
+        save_fnc: Callable,
+    ) -> Optional[FACTOR_TYPE]:
+        """Aggregates factors computed for all data and module partitions."""
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+        if not factors_output_dir.exists():
+            error_msg = f"Factors directory `{factors_output_dir}` not found when trying to aggregate factors."
+            self.logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+
+        all_required_partitions = [(i, j) for i in range(data_partitions) for j in range(module_partitions)]
+        all_partition_exists = all(
+            exist_fnc(output_dir=factors_output_dir, partition=partition) for partition in all_required_partitions
+        )
+        if not all_partition_exists:
+            self.logger.info("Factors are not aggregated as factors for some partitions are not yet computed.")
+            return
+
+        start_time = time.time()
+        aggregated_factors: FACTOR_TYPE = {}
+        for data_partition in range(data_partitions):
+            for module_partition in range(module_partitions):
+                loaded_factors = load_fnc(
+                    output_dir=factors_output_dir,
+                    partition=(data_partition, module_partition),
+                )
+                for factor_name, factors in loaded_factors.items():
+                    if factor_name not in aggregated_factors:
+                        aggregated_factors[factor_name]: Dict[str, torch.Tensor] = {}
+
+                    for module_name in factors:
+                        if module_name not in aggregated_factors[factor_name]:
+                            aggregated_factors[factor_name][module_name] = torch.zeros_like(
+                                factors[module_name],
+                                requires_grad=False,
+                            )
+                        aggregated_factors[factor_name][module_name].add_(factors[module_name])
+                del loaded_factors
+        save_fnc(
+            output_dir=factors_output_dir,
+            factors=aggregated_factors,
+        )
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        self.logger.info(f"Aggregated all factors in {elapsed_time:.2f} seconds.")
+
+
+==============================================================================================================
+ScoreComputer.compute_pairwise_scores
+==============================================================================================================
+    def compute_pairwise_scores(
+        self,
+        scores_name: str,
+        factors_name: str,
+        query_dataset: data.Dataset,
+        train_dataset: data.Dataset,
+        per_device_query_batch_size: int,
+        per_device_train_batch_size: Optional[int] = None,
+        initial_per_device_train_batch_size_attempt: int = 4096,
+        query_indices: Optional[Sequence[int]] = None,
+        train_indices: Optional[Sequence[int]] = None,
+        dataloader_kwargs: Optional[DataLoaderKwargs] = None,
+        score_args: Optional[ScoreArguments] = None,
+        target_data_partitions: Optional[Sequence[int]] = None,
+        target_module_partitions: Optional[Sequence[int]] = None,
+        overwrite_output_dir: bool = False,
+    ) -> Optional[SCORE_TYPE]:
+        """Computes pairwise influence scores with the given score configuration.
+
+        Args:
+            scores_name (str):
+                The unique identifier for the score, used to organize and retrieve the results.
+            factors_name (str):
+                The name of the factor to use for influence computations.
+            query_dataset (data.Dataset):
+                The query dataset, typically much smaller than the training dataset.
+            train_dataset (data.Dataset):
+                The training dataset.
+            per_device_query_batch_size (int):
+                The per-device batch size used to compute query gradients.
+            per_device_train_batch_size (int, optional):
+                The per-device batch size used to compute training gradients. If not specified, an executable
+                batch size will be found.
+            initial_per_device_train_batch_size_attempt (int, optional):
+                The initial attempted per-device batch size when the batch size is not provided.
+            query_indices (Sequence[int], optional):
+                The specific indices of the query dataset to compute the influence scores for. If not specified,
+                all query data points will be used.
+            train_indices (Sequence[int], optional):
+                The specific indices of the training dataset to compute the influence scores for. If not
+                specified, all training data points will be used.
+            dataloader_kwargs (DataLoaderKwargs, optional):
+                Controls additional arguments for PyTorch's DataLoader.
+            score_args (ScoreArguments, optional):
+                Arguments for score computation.
+            target_data_partitions (Sequence[int], optional):
+                Specific data partitions to compute influence scores. If not specified, scores for all
+                data partitions will be computed.
+            target_module_partitions (Sequence[int], optional):
+                Specific module partitions to compute influence scores. If not specified, scores for all
+                module partitions will be computed.
+            overwrite_output_dir (bool, optional):
+                Whether to overwrite existing output.
+        """
+        self.logger.debug(f"Computing pairwise scores with parameters: {locals()}")
+
+        scores_output_dir = self.scores_output_dir(scores_name=scores_name)
+        os.makedirs(scores_output_dir, exist_ok=True)
+        if pairwise_scores_exist(output_dir=scores_output_dir) and not overwrite_output_dir:
+            self.logger.info(f"Found existing pairwise scores at `{scores_output_dir}`. Skipping.")
+            return self.load_pairwise_scores(scores_name=scores_name)
+
+        factor_args, score_args = self._configure_and_save_score_args(
+            score_args=score_args,
+            scores_output_dir=scores_output_dir,
+            factors_name=factors_name,
+            overwrite_output_dir=overwrite_output_dir,
+        )
+
+        if score_args.compute_per_token_scores and score_args.aggregate_train_gradients:
+            warning_msg = (
+                "Token-wise influence computation is not compatible with `aggregate_train_gradients=True`. "
+                "Disabling `compute_per_token_scores`."
+            )
+            score_args.compute_per_token_scores = False
+            self.logger.warning(warning_msg)
+
+        if score_args.compute_per_token_scores and factor_args.has_shared_parameters:
+            warning_msg = (
+                "Token-wise influence computation is not compatible with `has_shared_parameters=True`. "
+                "Disabling `compute_per_token_scores`."
+            )
+            score_args.compute_per_token_scores = False
+            self.logger.warning(warning_msg)
+
+        if score_args.compute_per_token_scores and self.task.enable_post_process_per_sample_gradient:
+            warning_msg = (
+                "Token-wise influence computation is not compatible with tasks that requires "
+                "`enable_post_process_per_sample_gradient`. Disabling `compute_per_token_scores`."
+            )
+            score_args.compute_per_token_scores = False
+            self.logger.warning(warning_msg)
+
+        dataloader_params = self._configure_dataloader(dataloader_kwargs)
+        if self.state.is_main_process:
+            self._save_dataset_metadata(
+                dataset_name="query",
+                dataset=query_dataset,
+                indices=query_indices,
+                output_dir=scores_output_dir,
+                overwrite_output_dir=overwrite_output_dir,
+            )
+            self._save_dataset_metadata(
+                dataset_name="train",
+                dataset=train_dataset,
+                indices=train_indices,
+                output_dir=scores_output_dir,
+                overwrite_output_dir=overwrite_output_dir,
+            )
+        if query_indices is not None:
+            query_dataset = data.Subset(dataset=query_dataset, indices=query_indices)
+            del query_indices
+
+        if train_indices is not None:
+            train_dataset = data.Subset(dataset=train_dataset, indices=train_indices)
+            del train_indices
+
+        with self.profiler.profile("Load All Factors"):
+            loaded_factors = self.load_all_factors(
+                factors_name=factors_name,
+            )
+
+        no_partition = score_args.data_partitions == 1 and score_args.module_partitions == 1
+        partition_provided = target_data_partitions is not None or target_module_partitions is not None
+        if no_partition and partition_provided:
+            error_msg = (
+                "`target_data_partitions` or `target_module_partitions` were specified, while"
+                "the `ScoreArguments` did not expect any data and module partition to compute pairwise scores."
+            )
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        data_partition_indices, target_data_partitions = self._get_data_partition(
+            total_data_examples=len(train_dataset),
+            data_partitions=score_args.data_partitions,
+            target_data_partitions=target_data_partitions,
+        )
+        max_partition_examples = len(train_dataset) // score_args.data_partitions
+        module_partition_names, target_module_partitions = self._get_module_partition(
+            module_partitions=score_args.module_partitions,
+            target_module_partitions=target_module_partitions,
+        )
+
+        all_start_time = get_time(state=self.state)
+        for data_partition in target_data_partitions:
+            for module_partition in target_module_partitions:
+                if no_partition:
+                    partition = None
+                else:
+                    partition = (data_partition, module_partition)
+
+                if (
+                    pairwise_scores_exist(
+                        output_dir=scores_output_dir,
+                        partition=partition,
+                    )
+                    and not overwrite_output_dir
+                ):
+                    self.logger.info(
+                        f"Found existing pairwise scores for data partition {data_partition} "
+                        f"and module partition {module_partition} at {scores_output_dir}. Skipping."
+                    )
+                    continue
+
+                start_index, end_index = data_partition_indices[data_partition]
+                self.logger.info(
+                    f"Computing pairwise scores with data indices ({start_index}, {end_index}) and "
+                    f"modules {module_partition_names[module_partition]}."
+                )
+
+                if per_device_train_batch_size is None:
+                    per_device_train_batch_size = self._find_executable_pairwise_scores_batch_size(
+                        query_dataset=query_dataset,
+                        per_device_query_batch_size=per_device_query_batch_size
+                        if not score_args.aggregate_query_gradients
+                        else 1,
+                        train_dataset=train_dataset,
+                        initial_per_device_train_batch_size_attempt=initial_per_device_train_batch_size_attempt,
+                        loaded_factors=loaded_factors,
+                        dataloader_params=dataloader_params,
+                        total_data_examples=max_partition_examples,
+                        score_args=score_args,
+                        factor_args=factor_args,
+                        tracked_modules_name=module_partition_names[module_partition],
+                    )
+
+                self._reset_memory()
+                start_time = get_time(state=self.state)
+                with self.profiler.profile("Compute Pairwise Score"):
+                    query_loader = self._get_dataloader(
+                        dataset=query_dataset,
+                        per_device_batch_size=per_device_query_batch_size,
+                        dataloader_params=dataloader_params,
+                        allow_duplicates=not score_args.aggregate_query_gradients,
+                    )
+                    train_loader = self._get_dataloader(
+                        dataset=train_dataset,
+                        per_device_batch_size=per_device_train_batch_size,
+                        indices=list(range(start_index, end_index)),
+                        dataloader_params=dataloader_params,
+                        allow_duplicates=not score_args.aggregate_train_gradients,
+                        stack=not score_args.aggregate_train_gradients,
+                    )
+                    func = (
+                        compute_pairwise_scores_with_loaders
+                        if not score_args.aggregate_query_gradients
+                        else compute_pairwise_query_aggregated_scores_with_loaders
+                    )
+                    scores = func(
+                        model=self.model,
+                        state=self.state,
+                        task=self.task,
+                        loaded_factors=loaded_factors,
+                        query_loader=query_loader,
+                        train_loader=train_loader,
+                        per_device_query_batch_size=per_device_query_batch_size,
+                        score_args=score_args,
+                        factor_args=factor_args,
+                        tracked_module_names=module_partition_names[module_partition],
+                        disable_tqdm=self.disable_tqdm,
+                    )
+                end_time = get_time(state=self.state)
+                elapsed_time = end_time - start_time
+                self.logger.info(f"Computed pairwise influence scores in {elapsed_time:.2f} seconds.")
+
+                with self.profiler.profile("Save Pairwise Score"):
+                    if self.state.is_main_process:
+                        save_pairwise_scores(
+                            output_dir=scores_output_dir,
+                            scores=scores,
+                            partition=partition,
+                            metadata=score_args.to_str_dict(),
+                        )
+                    self.state.wait_for_everyone()
+                del scores, query_loader, train_loader
+                self._reset_memory()
+                self.logger.info(f"Saved pairwise scores at {scores_output_dir}.")
+
+        all_end_time = get_time(state=self.state)
+        elapsed_time = all_end_time - all_start_time
+        if not no_partition:
+            self.logger.info(f"Fitted all partitioned pairwise scores in {elapsed_time:.2f} seconds.")
+            if self.state.is_main_process:
+                self.aggregate_pairwise_scores(scores_name=scores_name)
+                self.logger.info(f"Saved aggregated pairwise scores at `{scores_output_dir}`.")
+            self.state.wait_for_everyone()
+        self._log_profile_summary(name=f"scores_{scores_name}_pairwise")
+
+
+==============================================================================================================
+Computer.load_all_factors
+==============================================================================================================
+    def load_all_factors(self, factors_name: str) -> FACTOR_TYPE:
+        """Loads all relevant factors from disk."""
+        from kronfluence.factor.config import (  # pylint: disable=import-outside-toplevel
+            FactorConfig,
+        )
+
+        factor_args = self.load_factor_args(factors_name)
+        factors_output_dir = self.factors_output_dir(factors_name=factors_name)
+        if factor_args is None:
+            error_msg = f"Factors with name `{factors_name}` was not found at `{factors_output_dir}`."
+            self.logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+
+        loaded_factors: FACTOR_TYPE = {}
+        factor_config = FactorConfig.CONFIGS[factor_args.strategy]
+        if factor_config.requires_covariance_matrices_for_precondition:
+            covariance_factors = self.load_covariance_matrices(factors_name=factors_name)
+            if covariance_factors is None:
+                error_msg = (
+                    f"Strategy `{factor_args.strategy}` requires covariance matrices. "
+                    f"However, the covariance matrices were not found."
+                )
+                self.logger.error(error_msg)
+                raise FactorsNotFoundError(error_msg)
+            loaded_factors.update(covariance_factors)
+
+        if factor_config.requires_eigendecomposition_for_precondition:
+            eigen_factors = self.load_eigendecomposition(factors_name=factors_name)
+            if eigen_factors is None:
+                error_msg = (
+                    f"Strategy `{factor_args.strategy}` requires Eigendecomposition results. "
+                    f"However, the Eigendecomposition results were not found."
+                )
+                self.logger.error(error_msg)
+                raise FactorsNotFoundError(error_msg)
+            loaded_factors.update(eigen_factors)
+
+        if factor_config.requires_lambda_matrices_for_precondition:
+            lambda_factors = self.load_lambda_matrices(factors_name=factors_name)
+            if lambda_factors is None:
+                error_msg = (
+                    f"Strategy `{factor_args.strategy}` requires Lambda matrices. "
+                    f"However, the Lambda matrices were not found."
+                )
+                self.logger.error(error_msg)
+                raise FactorsNotFoundError(error_msg)
+            loaded_factors.update(lambda_factors)
+        return loaded_factors
+
+
+==============================================================================================================
+eigen module
+==============================================================================================================
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.distributed as dist
+from accelerate.utils import find_batch_size, send_to_device
+from accelerate.utils.memory import should_reduce_batch_size
+from safetensors.torch import load_file, save_file
+from torch import autocast, nn
+from torch.cuda.amp import GradScaler
+from torch.utils import data
+from tqdm import tqdm
+
+from kronfluence.arguments import FactorArguments
+from kronfluence.module.tracked_module import ModuleMode
+from kronfluence.module.utils import (
+    finalize_iteration,
+    get_tracked_module_names,
+    load_factors,
+    set_factors,
+    set_gradient_scale,
+    set_mode,
+    synchronize_modules,
+    update_factor_args,
+)
+from kronfluence.task import Task
+from kronfluence.utils.constants import (
+    ACTIVATION_COVARIANCE_MATRIX_NAME,
+    ACTIVATION_EIGENVALUES_NAME,
+    ACTIVATION_EIGENVECTORS_NAME,
+    DISTRIBUTED_SYNC_INTERVAL,
+    EIGENDECOMPOSITION_FACTOR_NAMES,
+    FACTOR_TYPE,
+    GRADIENT_COVARIANCE_MATRIX_NAME,
+    GRADIENT_EIGENVALUES_NAME,
+    GRADIENT_EIGENVECTORS_NAME,
+    LAMBDA_FACTOR_NAMES,
+    NUM_ACTIVATION_COVARIANCE_PROCESSED,
+    NUM_GRADIENT_COVARIANCE_PROCESSED,
+    PARTITION_TYPE,
+)
+from kronfluence.utils.logger import TQDM_BAR_FORMAT
+from kronfluence.utils.state import State, no_sync, release_memory
+
+
+def eigendecomposition_save_path(
+    output_dir: Path,
+    factor_name: str,
+) -> Path:
+    """Generates the path for saving or loading eigendecomposition results.
+
+    Args:
+        output_dir (Path):
+            Directory to save or load eigenvectors and eigenvalues.
+        factor_name (str):
+            Name of the factor (must be in `EIGENDECOMPOSITION_FACTOR_NAMES`).
+
+    Returns:
+        Path:
+            The full path for the eigendecomposition file.
+
+    Raises:
+        AssertionError:
+            If `factor_name` is not in `EIGENDECOMPOSITION_FACTOR_NAMES`.
+    """
+    assert factor_name in EIGENDECOMPOSITION_FACTOR_NAMES
+    return output_dir / f"{factor_name}.safetensors"
+
+
+def save_eigendecomposition(output_dir: Path, factors: FACTOR_TYPE, metadata: Optional[Dict[str, str]] = None) -> None:
+    """Saves eigendecomposition results to disk.
+
+    Args:
+        output_dir (Path):
+            Directory to save the eigenvectors and eigenvalues.
+        factors (FACTOR_TYPE):
+            Dictionary of factors to save.
+        metadata (Dict[str, str], optional):
+            Additional metadata to save with the factors.
+
+    Raises:
+        AssertionError:
+            If factors keys don't match `EIGENDECOMPOSITION_FACTOR_NAMES`.
+    """
+    assert set(factors.keys()) == set(EIGENDECOMPOSITION_FACTOR_NAMES)
+    for factor_name in factors:
+        save_path = eigendecomposition_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+        )
+        save_file(tensors=factors[factor_name], filename=save_path, metadata=metadata)
+
+
+def load_eigendecomposition(
+    output_dir: Path,
+) -> FACTOR_TYPE:
+    """Loads eigendecomposition results from disk.
+
+    Args:
+        output_dir (Path):
+            Directory to load the results from.
+
+    Returns:
+        FACTOR_TYPE:
+            Dictionary of loaded eigendecomposition results.
+    """
+    eigen_factors = {}
+    for factor_name in EIGENDECOMPOSITION_FACTOR_NAMES:
+        save_path = eigendecomposition_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+        )
+        eigen_factors[factor_name] = load_file(filename=save_path)
+    return eigen_factors
+
+
+def eigendecomposition_exist(
+    output_dir: Path,
+) -> bool:
+    """Checks if eigendecomposition results exist at the specified directory.
+
+    Args:
+        output_dir (Path):
+            Directory to check for results.
+
+    Returns:
+        bool:
+            `True` if all eigendecomposition results exist, `False` otherwise.
+    """
+    for factor_name in EIGENDECOMPOSITION_FACTOR_NAMES:
+        save_path = eigendecomposition_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+        )
+        if not save_path.exists():
+            return False
+    return True
+
+
+@torch.no_grad()
+def perform_eigendecomposition(
+    covariance_factors: FACTOR_TYPE,
+    model: nn.Module,
+    state: State,
+    factor_args: FactorArguments,
+    disable_tqdm: bool = False,
+) -> FACTOR_TYPE:
+    """Performs eigendecomposition on activation and pseudo-gradient covariance matrices.
+
+    Args:
+        covariance_factors (FACTOR_TYPE):
+            Computed covariance factors.
+        model (nn.Module):
+            The model used to compute covariance matrices.
+        state (State):
+            The current process's information (e.g., device being used).
+        factor_args (FactorArguments):
+            Arguments for performing eigendecomposition.
+        disable_tqdm (bool, optional):
+            Whether to disable the progress bar. Defaults to `False`.
+
+    Returns:
+        FACTOR_TYPE:
+            The results are organized in nested dictionaries, where the first key is the name of the factor
+            (e.g., activation eigenvector), and the second key is the module name.
+    """
+    eigen_factors: FACTOR_TYPE = {}
+    for factor_name in EIGENDECOMPOSITION_FACTOR_NAMES:
+        eigen_factors[factor_name] = {}
+    tracked_module_names = get_tracked_module_names(model=model)
+
+    with tqdm(
+        total=len(tracked_module_names),
+        desc="Performing Eigendecomposition",
+        bar_format=TQDM_BAR_FORMAT,
+        disable=not state.is_main_process or disable_tqdm,
+    ) as pbar:
+        for module_name in tracked_module_names:
+            for covariance_name, num_processed_name, eigenvectors_name, eigenvalues_name in [
+                (
+                    ACTIVATION_COVARIANCE_MATRIX_NAME,
+                    NUM_ACTIVATION_COVARIANCE_PROCESSED,
+                    ACTIVATION_EIGENVECTORS_NAME,
+                    ACTIVATION_EIGENVALUES_NAME,
+                ),
+                (
+                    GRADIENT_COVARIANCE_MATRIX_NAME,
+                    NUM_GRADIENT_COVARIANCE_PROCESSED,
+                    GRADIENT_EIGENVECTORS_NAME,
+                    GRADIENT_EIGENVALUES_NAME,
+                ),
+            ]:
+                original_dtype = covariance_factors[covariance_name][module_name].dtype
+                covariance_matrix = covariance_factors[covariance_name][module_name].to(
+                    device=state.device,
+                    dtype=factor_args.eigendecomposition_dtype,
+                )
+                # Normalize covariance matrices.
+                covariance_matrix.div_(covariance_factors[num_processed_name][module_name].to(device=state.device))
+                # In cases where covariance matrices are not exactly symmetric due to numerical issues.
+                covariance_matrix = covariance_matrix + covariance_matrix.t()
+                covariance_matrix.mul_(0.5)
+
+                try:
+                    eigenvalues, eigenvectors = torch.linalg.eigh(covariance_matrix)
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    # If we get OOM error, release the memory and try again.
+                    if should_reduce_batch_size(exception=e):  # pylint: disable=no-else-continue
+                        release_memory()
+                        eigenvalues, eigenvectors = torch.linalg.eigh(covariance_matrix)
+                    else:
+                        raise
+                # Covariance matrices are PSD; clamp tiny negative roundoff to zero so
+                # downstream damping/reciprocal can't divide by a negative value.
+                eigenvalues.clamp_(min=0)
+                del covariance_matrix
+                eigen_factors[eigenvalues_name][module_name] = eigenvalues.contiguous().to(
+                    dtype=original_dtype, device="cpu"
+                )
+                eigen_factors[eigenvectors_name][module_name] = eigenvectors.contiguous().to(
+                    dtype=original_dtype, device="cpu"
+                )
+                del eigenvalues, eigenvectors
+
+            pbar.update(1)
+
+    return eigen_factors
+
+
+def lambda_matrices_save_path(
+    output_dir: Path,
+    factor_name: str,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> Path:
+    """Generates the path for saving or loading Lambda matrices.
+
+    Args:
+        output_dir (Path):
+            Directory to save or load the matrices.
+        factor_name (str):
+            Name of the factor (must be in `LAMBDA_FACTOR_NAMES`).
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        Path:
+            The full path for the Lambda matrix file.
+
+    Raises:
+        AssertionError:
+            If `factor_name` is not in `LAMBDA_FACTOR_NAMES`.
+    """
+    assert factor_name in LAMBDA_FACTOR_NAMES
+    if partition is not None:
+        data_partition, module_partition = partition
+        return output_dir / (
+            f"{factor_name}_data_partition{data_partition}_module_partition{module_partition}.safetensors"
+        )
+    return output_dir / f"{factor_name}.safetensors"
+
+
+def save_lambda_matrices(
+    output_dir: Path,
+    factors: FACTOR_TYPE,
+    partition: Optional[PARTITION_TYPE] = None,
+    metadata: Optional[Dict[str, str]] = None,
+) -> None:
+    """Saves Lambda matrices to disk.
+
+    Args:
+        output_dir (Path):
+            Directory to save the matrices.
+        factors (FACTOR_TYPE):
+            Dictionary of factors to save.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+        metadata (Dict[str, str], optional):
+            Additional metadata to save with the factors.
+
+    Raises:
+        AssertionError:
+            If factors keys don't match `LAMBDA_FACTOR_NAMES`.
+    """
+    assert set(factors.keys()) == set(LAMBDA_FACTOR_NAMES)
+    for factor_name in factors:
+        save_path = lambda_matrices_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+            partition=partition,
+        )
+        save_file(tensors=factors[factor_name], filename=save_path, metadata=metadata)
+
+
+def load_lambda_matrices(
+    output_dir: Path,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> FACTOR_TYPE:
+    """Loads Lambda matrices from disk.
+
+    Args:
+        output_dir (Path):
+            Directory to load the matrices from.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        FACTOR_TYPE:
+            Dictionary of loaded Lambda factors.
+    """
+    lambda_factors = {}
+    for factor_name in LAMBDA_FACTOR_NAMES:
+        save_path = lambda_matrices_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+            partition=partition,
+        )
+        lambda_factors[factor_name] = load_file(filename=save_path)
+    return lambda_factors
+
+
+def lambda_matrices_exist(
+    output_dir: Path,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> bool:
+    """Checks if Lambda matrices exist at the specified directory.
+
+    Args:
+        output_dir (Path):
+            Directory to check for matrices.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        bool:
+            `True` if all Lambda matrices exist, `False` otherwise.
+    """
+    for factor_name in LAMBDA_FACTOR_NAMES:
+        save_path = lambda_matrices_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+            partition=partition,
+        )
+        if not save_path.exists():
+            return False
+    return True
+
+
+def fit_lambda_matrices_with_loader(
+    model: nn.Module,
+    state: State,
+    task: Task,
+    loader: data.DataLoader,
+    factor_args: FactorArguments,
+    eigen_factors: Optional[FACTOR_TYPE] = None,
+    tracked_module_names: Optional[List[str]] = None,
+    disable_tqdm: bool = False,
+) -> Tuple[torch.Tensor, FACTOR_TYPE]:
+    """Computes Lambda matrices for a given model and task.
+
+    Args:
+        model (nn.Module):
+            The model for which Lambda matrices will be computed.
+        state (State):
+            The current process's information (e.g., device being used).
+        task (Task):
+            The specific task associated with the model.
+        loader (data.DataLoader):
+            The data loader that will be used to compute Lambda matrices.
+        factor_args (FactorArguments):
+            Arguments for computing Lambda matrices.
+        eigen_factors (FACTOR_TYPE, optional):
+            Computed eigendecomposition results.
+        tracked_module_names (List[str], optional):
+            A list of module names for which Lambda matrices will be computed. If not specified,
+            Lambda matrices will be computed for all tracked modules.
+        disable_tqdm (bool, optional):
+            Whether to disable the progress bar. Defaults to `False`.
+
+    Returns:
+        Tuple[torch.Tensor, FACTOR_TYPE]:
+            - Number of data points processed.
+            - Computed Lambda matrices (nested dict: factor_name -> module_name -> tensor).
+    """
+    update_factor_args(model=model, factor_args=factor_args)
+    if tracked_module_names is None:
+        tracked_module_names = get_tracked_module_names(model=model)
+    set_mode(
+        model=model,
+        tracked_module_names=tracked_module_names,
+        mode=ModuleMode.LAMBDA,
+        release_memory=True,
+    )
+    if eigen_factors is not None:
+        for name in eigen_factors:
+            set_factors(model=model, factor_name=name, factors=eigen_factors[name], clone=True)
+
+    total_steps = 0
+    num_data_processed = torch.zeros((1,), dtype=torch.int64, requires_grad=False)
+    enable_amp = factor_args.amp_dtype is not None
+    enable_grad_scaler = enable_amp and factor_args.amp_dtype == torch.float16
+    scaler = GradScaler(init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
+    if enable_grad_scaler:
+        gradient_scale = 1.0 / scaler.get_scale()
+        set_gradient_scale(model=model, gradient_scale=gradient_scale)
+
+    with tqdm(
+        total=len(loader),
+        desc="Fitting Lambda matrices",
+        bar_format=TQDM_BAR_FORMAT,
+        disable=not state.is_main_process or disable_tqdm,
+    ) as pbar:
+        for index, batch in enumerate(loader):
+            batch = send_to_device(tensor=batch, device=state.device)
+
+            with no_sync(model=model, state=state):
+                model.zero_grad(set_to_none=True)
+                with autocast(device_type=state.device.type, enabled=enable_amp, dtype=factor_args.amp_dtype):
+                    loss = task.compute_train_loss(
+                        batch=batch,
+                        model=model,
+                        sample=not factor_args.use_empirical_fisher,
+                    )
+                scaler.scale(loss).backward()
+
+            if factor_args.has_shared_parameters:
+                finalize_iteration(model=model, tracked_module_names=tracked_module_names)
+
+            if (
+                state.use_distributed
+                and total_steps % DISTRIBUTED_SYNC_INTERVAL == 0
+                and index not in [len(loader) - 1, len(loader) - 2]
+            ):
+                state.wait_for_everyone()
+
+            num_data_processed.add_(find_batch_size(data=batch))
+            del loss
+            total_steps += 1
+            pbar.update(1)
+
+    if state.use_distributed:
+        synchronize_modules(model=model, tracked_module_names=tracked_module_names)
+        num_data_processed = num_data_processed.to(device=state.device)
+        dist.all_reduce(tensor=num_data_processed, op=torch.distributed.ReduceOp.SUM)
+        num_data_processed = num_data_processed.cpu()
+
+    saved_factors: FACTOR_TYPE = {}
+    if state.is_main_process:
+        for factor_name in LAMBDA_FACTOR_NAMES:
+            factor = load_factors(
+                model=model,
+                factor_name=factor_name,
+                tracked_module_names=tracked_module_names,
+                cpu=True,
+            )
+            if len(factor) == 0:
+                raise ValueError(f"Factor `{factor_name}` has not been computed.")
+            saved_factors[factor_name] = factor
+
+    model.zero_grad(set_to_none=True)
+    if enable_grad_scaler:
+        set_gradient_scale(model=model, gradient_scale=1.0)
+    set_mode(model=model, mode=ModuleMode.DEFAULT, release_memory=True)
+    state.wait_for_everyone()
+
+    return num_data_processed, saved_factors
+
+
+==============================================================================================================
+covariance module
+==============================================================================================================
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.distributed as dist
+from accelerate.utils import find_batch_size, send_to_device
+from safetensors.torch import load_file, save_file
+from torch import autocast, nn
+from torch.cuda.amp import GradScaler
+from torch.utils import data
+from tqdm import tqdm
+
+from kronfluence.arguments import FactorArguments
+from kronfluence.module.tracked_module import ModuleMode
+from kronfluence.module.utils import (
+    get_tracked_module_names,
+    load_factors,
+    set_attention_mask,
+    set_gradient_scale,
+    set_mode,
+    synchronize_modules,
+    update_factor_args,
+)
+from kronfluence.task import Task
+from kronfluence.utils.constants import (
+    COVARIANCE_FACTOR_NAMES,
+    DISTRIBUTED_SYNC_INTERVAL,
+    FACTOR_TYPE,
+    PARTITION_TYPE,
+)
+from kronfluence.utils.logger import TQDM_BAR_FORMAT
+from kronfluence.utils.state import State, no_sync
+
+
+def covariance_matrices_save_path(
+    output_dir: Path,
+    factor_name: str,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> Path:
+    """Generates the path for saving or loading covariance matrices.
+
+    Args:
+        output_dir (Path):
+            Directory to save or load the matrices.
+        factor_name (str):
+            Name of the factor (must be in `COVARIANCE_FACTOR_NAMES`).
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        Path:
+            The full path for the covariance matrix file.
+
+    Raises:
+        AssertionError:
+            If `factor_name` is not in `COVARIANCE_FACTOR_NAMES`.
+    """
+    assert factor_name in COVARIANCE_FACTOR_NAMES
+    if partition is not None:
+        data_partition, module_partition = partition
+        return output_dir / (
+            f"{factor_name}_data_partition{data_partition}_module_partition{module_partition}.safetensors"
+        )
+    return output_dir / f"{factor_name}.safetensors"
+
+
+def save_covariance_matrices(
+    output_dir: Path,
+    factors: FACTOR_TYPE,
+    partition: Optional[PARTITION_TYPE] = None,
+    metadata: Optional[Dict[str, str]] = None,
+) -> None:
+    """Saves covariance matrices to disk.
+
+    Args:
+        output_dir (Path):
+            Directory to save the matrices.
+        factors (FACTOR_TYPE):
+            Dictionary of factors to save.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+        metadata (Dict[str, str], optional):
+            Additional metadata to save with the factors.
+
+    Raises:
+        AssertionError:
+            If factors keys don't match `COVARIANCE_FACTOR_NAMES`.
+    """
+    assert set(factors.keys()) == set(COVARIANCE_FACTOR_NAMES)
+    for factor_name in factors:
+        save_path = covariance_matrices_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+            partition=partition,
+        )
+        save_file(tensors=factors[factor_name], filename=save_path, metadata=metadata)
+
+
+def load_covariance_matrices(
+    output_dir: Path,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> FACTOR_TYPE:
+    """Loads covariance matrices from disk.
+
+    Args:
+        output_dir (Path):
+            Directory to load the matrices from.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        FACTOR_TYPE:
+            Dictionary of loaded covariance factors.
+    """
+    covariance_factors = {}
+    for factor_name in COVARIANCE_FACTOR_NAMES:
+        save_path = covariance_matrices_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+            partition=partition,
+        )
+        covariance_factors[factor_name] = load_file(filename=save_path)
+    return covariance_factors
+
+
+def covariance_matrices_exist(
+    output_dir: Path,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> bool:
+    """Checks if covariance matrices exist at the specified directory.
+
+    Args:
+        output_dir (Path):
+            Directory to check for matrices.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        bool:
+            `True` if all covariance matrices exist, `False` otherwise.
+    """
+    for factor_name in COVARIANCE_FACTOR_NAMES:
+        save_path = covariance_matrices_save_path(
+            output_dir=output_dir,
+            factor_name=factor_name,
+            partition=partition,
+        )
+        if not save_path.exists():
+            return False
+    return True
+
+
+def fit_covariance_matrices_with_loader(
+    model: nn.Module,
+    state: State,
+    task: Task,
+    loader: data.DataLoader,
+    factor_args: FactorArguments,
+    tracked_module_names: Optional[List[str]] = None,
+    disable_tqdm: bool = False,
+) -> Tuple[torch.Tensor, FACTOR_TYPE]:
+    """Computes activation and pseudo-gradient covariance matrices for a given model and task.
+
+    Args:
+        model (nn.Module):
+            The model for which covariance matrices will be computed.
+        state (State):
+            The current process's information (e.g., device being used).
+        task (Task):
+            The specific task associated with the model.
+        loader (data.DataLoader):
+            The data loader that will be used to fit covariance matrices.
+        factor_args (FactorArguments):
+            Arguments for computing covariance matrices.
+        tracked_module_names (List[str], optional):
+            A list of module names for which covariance matrices will be computed. If not specified,
+            covariance matrices will be computed for all tracked modules.
+        disable_tqdm (bool, optional):
+            Whether to disable the progress bar. Defaults to `False`.
+
+    Returns:
+        Tuple[torch.Tensor, FACTOR_TYPE]:
+            - Number of data points processed.
+            - Computed covariance matrices (nested dict: factor_name -> module_name -> tensor).
+    """
+    update_factor_args(model=model, factor_args=factor_args)
+    if tracked_module_names is None:
+        tracked_module_names = get_tracked_module_names(model=model)
+    set_mode(
+        model=model,
+        tracked_module_names=tracked_module_names,
+        mode=ModuleMode.COVARIANCE,
+        release_memory=True,
+    )
+
+    total_steps = 0
+    num_data_processed = torch.zeros((1,), dtype=torch.int64, requires_grad=False)
+    enable_amp = factor_args.amp_dtype is not None
+    enable_grad_scaler = enable_amp and factor_args.amp_dtype == torch.float16
+    scaler = GradScaler(init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
+    if enable_grad_scaler:
+        gradient_scale = 1.0 / scaler.get_scale()
+        set_gradient_scale(model=model, gradient_scale=gradient_scale)
+
+    with tqdm(
+        total=len(loader),
+        desc="Fitting covariance matrices",
+        bar_format=TQDM_BAR_FORMAT,
+        disable=not state.is_main_process or disable_tqdm,
+    ) as pbar:
+        for index, batch in enumerate(loader):
+            batch = send_to_device(batch, device=state.device)
+
+            attention_mask = task.get_attention_mask(batch=batch)
+            if attention_mask is not None:
+                set_attention_mask(model=model, attention_mask=attention_mask)
+
+            with no_sync(model=model, state=state):
+                model.zero_grad(set_to_none=True)
+                with autocast(device_type=state.device.type, enabled=enable_amp, dtype=factor_args.amp_dtype):
+                    loss = task.compute_train_loss(
+                        batch=batch,
+                        model=model,
+                        sample=not factor_args.use_empirical_fisher,
+                    )
+                scaler.scale(loss).backward()
+
+            if (
+                state.use_distributed
+                and total_steps % DISTRIBUTED_SYNC_INTERVAL == 0
+                and index not in [len(loader) - 1, len(loader) - 2]
+            ):
+                state.wait_for_everyone()
+
+            num_data_processed.add_(find_batch_size(data=batch))
+            del loss
+            total_steps += 1
+            pbar.update(1)
+
+    if state.use_distributed:
+        synchronize_modules(model=model, tracked_module_names=tracked_module_names)
+        num_data_processed = num_data_processed.to(device=state.device)
+        dist.all_reduce(tensor=num_data_processed, op=torch.distributed.ReduceOp.SUM)
+        num_data_processed = num_data_processed.cpu()
+
+    saved_factors: FACTOR_TYPE = {}
+    if state.is_main_process:
+        for factor_name in COVARIANCE_FACTOR_NAMES:
+            factor = load_factors(
+                model=model,
+                factor_name=factor_name,
+                tracked_module_names=tracked_module_names,
+                cpu=True,
+            )
+            if len(factor) == 0:
+                raise ValueError(f"Factor `{factor_name}` has not been computed.")
+            saved_factors[factor_name] = factor
+
+    model.zero_grad(set_to_none=True)
+    set_attention_mask(model=model, attention_mask=None)
+    if enable_grad_scaler:
+        set_gradient_scale(model=model, gradient_scale=1.0)
+    set_mode(model=model, mode=ModuleMode.DEFAULT, release_memory=True)
+    state.wait_for_everyone()
+
+    return num_data_processed, saved_factors
+
+
+==============================================================================================================
+pairwise module
+==============================================================================================================
+from pathlib import Path
+from typing import Dict, List, Optional, Union
+
+import torch
+from accelerate.utils import send_to_device
+from safetensors.torch import load_file, save_file
+from torch import autocast, nn
+from torch.cuda.amp import GradScaler
+from torch.utils import data
+from tqdm import tqdm
+
+from kronfluence.arguments import FactorArguments, ScoreArguments
+from kronfluence.module.tracked_module import ModuleMode
+from kronfluence.module.utils import (
+    accumulate_iterations,
+    finalize_all_iterations,
+    finalize_iteration,
+    get_tracked_module_names,
+    prepare_modules,
+    set_factors,
+    set_gradient_scale,
+    set_mode,
+    synchronize_modules,
+    truncate,
+    update_factor_args,
+    update_score_args,
+)
+from kronfluence.score.dot_product import (
+    compute_aggregated_dot_products_with_loader,
+    compute_dot_products_with_loader,
+)
+from kronfluence.task import Task
+from kronfluence.utils.constants import FACTOR_TYPE, PARTITION_TYPE, SCORE_TYPE
+from kronfluence.utils.logger import TQDM_BAR_FORMAT
+from kronfluence.utils.state import State, no_sync
+
+
+def pairwise_scores_save_path(
+    output_dir: Path,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> Path:
+    """Generates the path for saving or loading pairwise influence scores.
+
+    Args:
+        output_dir (Path):
+            Directory to save or load the matrices.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        Path:
+            The full path for the score file.
+    """
+    if partition is not None:
+        data_partition, module_partition = partition
+        return output_dir / (
+            f"pairwise_scores_data_partition{data_partition}_module_partition{module_partition}.safetensors"
+        )
+    return output_dir / "pairwise_scores.safetensors"
+
+
+def save_pairwise_scores(
+    output_dir: Path,
+    scores: SCORE_TYPE,
+    partition: Optional[PARTITION_TYPE] = None,
+    metadata: Optional[Dict[str, str]] = None,
+) -> None:
+    """Saves pairwise scores to disk.
+
+    Args:
+        output_dir (Path):
+            Directory to save the scores.
+        scores (SCORE_TYPE):
+            Dictionary of scores to save.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+        metadata (Dict[str, str], optional):
+            Additional metadata to save with the scores.
+    """
+    save_path = pairwise_scores_save_path(
+        output_dir=output_dir,
+        partition=partition,
+    )
+    save_file(tensors=scores, filename=save_path, metadata=metadata)
+
+
+def load_pairwise_scores(
+    output_dir: Path,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> SCORE_TYPE:
+    """Loads pairwise scores from disk.
+
+    Args:
+        output_dir (Path):
+            Directory to load the scores from.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        SCORE_TYPE:
+            Dictionary of loaded scores.
+    """
+    save_path = pairwise_scores_save_path(
+        output_dir=output_dir,
+        partition=partition,
+    )
+    return load_file(filename=save_path)
+
+
+def pairwise_scores_exist(
+    output_dir: Path,
+    partition: Optional[PARTITION_TYPE] = None,
+) -> bool:
+    """Checks if pairwise influence scores exist at the specified directory.
+
+    Args:
+        output_dir (Path):
+            Directory to check for scores.
+        partition (PARTITION_TYPE, optional):
+            Partition information, if any.
+
+    Returns:
+        bool:
+            `True` if scores exist, `False` otherwise.
+    """
+    save_path = pairwise_scores_save_path(
+        output_dir=output_dir,
+        partition=partition,
+    )
+    return save_path.exists()
+
+
+def compute_pairwise_scores_with_loaders(
+    loaded_factors: FACTOR_TYPE,
+    model: nn.Module,
+    state: State,
+    task: Task,
+    query_loader: data.DataLoader,
+    per_device_query_batch_size: int,
+    train_loader: data.DataLoader,
+    score_args: ScoreArguments,
+    factor_args: FactorArguments,
+    tracked_module_names: Optional[List[str]],
+    disable_tqdm: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Computes pairwise influence scores for a given model and task.
+
+    Args:
+        loaded_factors (FACTOR_TYPE):
+            Computed factors.
+        model (nn.Module):
+            The model for which pairwise influence scores will be computed.
+        state (State):
+            The current process's information (e.g., device being used).
+        task (Task):
+            The specific task associated with the model.
+        query_loader (data.DataLoader):
+            The data loader that will be used to compute query gradients.
+        per_device_query_batch_size (int):
+            Per-device batch size for the query data loader.
+        train_loader (data.DataLoader):
+            The data loader that will be used to compute training gradients.
+        score_args (ScoreArguments):
+            Arguments for computing pairwise scores.
+        factor_args (FactorArguments):
+            Arguments used to compute factors.
+        tracked_module_names (List[str], optional):
+            A list of module names that pairwise scores will be computed. If not specified, scores
+            will be computed for all available tracked modules.
+        disable_tqdm (bool, optional):
+            Whether to disable the progress bar. Defaults to `False`.
+
+    Returns:
+        SCORE_TYPE:
+            A dictionary containing the module name and its pairwise influence scores.
+    """
+    update_factor_args(model=model, factor_args=factor_args)
+    update_score_args(model=model, score_args=score_args)
+    if tracked_module_names is None:
+        tracked_module_names = get_tracked_module_names(model=model)
+    set_mode(
+        model=model,
+        mode=ModuleMode.PRECONDITION_GRADIENT,
+        tracked_module_names=tracked_module_names,
+        release_memory=True,
+    )
+    if len(loaded_factors) > 0:
+        for name in loaded_factors:
+            set_factors(
+                model=model,
+                factor_name=name,
+                factors=loaded_factors[name],
+                clone=True,
+            )
+    prepare_modules(model=model, tracked_module_names=tracked_module_names, device=state.device)
+
+    total_scores_chunks: Dict[str, Union[List[torch.Tensor], torch.Tensor]] = {}
+    total_query_batch_size = per_device_query_batch_size * state.num_processes
+    query_remainder = len(query_loader.dataset) % total_query_batch_size
+
+    num_batches = len(query_loader)
+    query_iter = iter(query_loader)
+    num_accumulations = 0
+    enable_amp = score_args.amp_dtype is not None
+    enable_grad_scaler = enable_amp and score_args.amp_dtype == torch.float16
+    scaler = GradScaler(init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
+    if enable_grad_scaler:
+        gradient_scale = 1.0 / scaler.get_scale()
+        set_gradient_scale(model=model, gradient_scale=gradient_scale)
+
+    dot_product_func = (
+        compute_aggregated_dot_products_with_loader
+        if score_args.aggregate_train_gradients
+        else compute_dot_products_with_loader
+    )
+
+    with tqdm(
+        total=num_batches,
+        desc="Computing pairwise scores (query gradient)",
+        bar_format=TQDM_BAR_FORMAT,
+        disable=not state.is_main_process or disable_tqdm,
+    ) as pbar:
+        for query_index in range(num_batches):
+            query_batch = next(query_iter)
+            query_batch = send_to_device(
+                tensor=query_batch,
+                device=state.device,
+            )
+
+            with no_sync(model=model, state=state):
+                model.zero_grad(set_to_none=True)
+                with autocast(device_type=state.device.type, enabled=enable_amp, dtype=score_args.amp_dtype):
+                    measurement = task.compute_measurement(batch=query_batch, model=model)
+                scaler.scale(measurement).backward()
+
+            if factor_args.has_shared_parameters:
+                finalize_iteration(model=model, tracked_module_names=tracked_module_names)
+
+            if state.use_distributed:
+                # Stack preconditioned query gradient across multiple devices or nodes.
+                synchronize_modules(
+                    model=model, tracked_module_names=tracked_module_names, num_processes=state.num_processes
+                )
+                if query_index == len(query_loader) - 1 and query_remainder > 0:
+                    # Removes duplicate data points if the dataset is not evenly divisible by the current batch size.
+                    truncate(model=model, tracked_module_names=tracked_module_names, keep_size=query_remainder)
+            accumulate_iterations(model=model, tracked_module_names=tracked_module_names)
+            del query_batch, measurement
+
+            num_accumulations += 1
+            if (
+                num_accumulations < score_args.query_gradient_accumulation_steps
+                and query_index != len(query_loader) - 1
+            ):
+                pbar.update(1)
+                continue
+
+            # Computes the dot product between preconditioning query gradient and all training gradients.
+            scores = dot_product_func(
+                model=model,
+                state=state,
+                task=task,
+                train_loader=train_loader,
+                factor_args=factor_args,
+                score_args=score_args,
+                tracked_module_names=tracked_module_names,
+                scaler=scaler,
+                disable_tqdm=disable_tqdm,
+            )
+
+            if state.is_main_process:
+                for module_name, current_scores in scores.items():
+                    if module_name not in total_scores_chunks:
+                        total_scores_chunks[module_name] = []
+                    total_scores_chunks[module_name].append(current_scores)
+            del scores
+            state.wait_for_everyone()
+
+            num_accumulations = 0
+            pbar.update(1)
+
+    if state.is_main_process:
+        for module_name in total_scores_chunks:
+            total_scores_chunks[module_name] = torch.cat(total_scores_chunks[module_name], dim=0)
+
+    model.zero_grad(set_to_none=True)
+    if enable_grad_scaler:
+        set_gradient_scale(model=model, gradient_scale=1.0)
+    finalize_all_iterations(model=model, tracked_module_names=tracked_module_names)
+    set_mode(model=model, mode=ModuleMode.DEFAULT, release_memory=True)
+    state.wait_for_everyone()
+
+    return total_scores_chunks
+
+
+def compute_pairwise_query_aggregated_scores_with_loaders(
+    loaded_factors: FACTOR_TYPE,
+    model: nn.Module,
+    state: State,
+    task: Task,
+    query_loader: data.DataLoader,
+    per_device_query_batch_size: int,
+    train_loader: data.DataLoader,
+    score_args: ScoreArguments,
+    factor_args: FactorArguments,
+    tracked_module_names: Optional[List[str]],
+    disable_tqdm: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Computes pairwise influence scores (with query gradients aggregated) for a given model and task. See
+    `compute_pairwise_scores_with_loaders` for detailed information."""
+    del per_device_query_batch_size
+    update_factor_args(model=model, factor_args=factor_args)
+    update_score_args(model=model, score_args=score_args)
+    if tracked_module_names is None:
+        tracked_module_names = get_tracked_module_names(model=model)
+    set_mode(
+        model=model,
+        mode=ModuleMode.GRADIENT_AGGREGATION,
+        tracked_module_names=tracked_module_names,
+        release_memory=True,
+    )
+    if len(loaded_factors) > 0:
+        for name in loaded_factors:
+            set_factors(model=model, factor_name=name, factors=loaded_factors[name], clone=True)
+    prepare_modules(model=model, tracked_module_names=tracked_module_names, device=state.device)
+
+    enable_amp = score_args.amp_dtype is not None
+    enable_grad_scaler = enable_amp and score_args.amp_dtype == torch.float16
+    scaler = GradScaler(init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
+    if enable_grad_scaler:
+        gradient_scale = 1.0 / scaler.get_scale()
+        set_gradient_scale(model=model, gradient_scale=gradient_scale)
+
+    dot_product_func = (
+        compute_aggregated_dot_products_with_loader
+        if score_args.aggregate_train_gradients
+        else compute_dot_products_with_loader
+    )
+
+    with tqdm(
+        total=len(query_loader),
+        desc="Computing pairwise scores (query gradient)",
+        bar_format=TQDM_BAR_FORMAT,
+        disable=not state.is_main_process or disable_tqdm,
+    ) as pbar:
+        for query_batch in query_loader:
+            query_batch = send_to_device(
+                tensor=query_batch,
+                device=state.device,
+            )
+
+            with no_sync(model=model, state=state):
+                model.zero_grad(set_to_none=True)
+                with autocast(device_type=state.device.type, enabled=enable_amp, dtype=score_args.amp_dtype):
+                    measurement = task.compute_measurement(batch=query_batch, model=model)
+                scaler.scale(measurement).backward()
+
+            if factor_args.has_shared_parameters:
+                finalize_iteration(model=model, tracked_module_names=tracked_module_names)
+
+            del measurement
+            pbar.update(1)
+
+    if state.use_distributed:
+        synchronize_modules(model=model, tracked_module_names=tracked_module_names)
+
+    set_mode(
+        model=model,
+        mode=ModuleMode.PRECONDITION_GRADIENT,
+        tracked_module_names=tracked_module_names,
+        release_memory=False,
+    )
+    finalize_all_iterations(model=model, tracked_module_names=tracked_module_names)
+
+    scores = dot_product_func(
+        model=model,
+        state=state,
+        task=task,
+        train_loader=train_loader,
+        factor_args=factor_args,
+        score_args=score_args,
+        tracked_module_names=tracked_module_names,
+        scaler=scaler,
+        disable_tqdm=disable_tqdm,
+    )
+
+    model.zero_grad(set_to_none=True)
+    if enable_grad_scaler:
+        set_gradient_scale(model=model, gradient_scale=1.0)
+    set_mode(model=model, mode=ModuleMode.DEFAULT, release_memory=True)
+    state.wait_for_everyone()
+
+    return scores
+
+
+==============================================================================================================
+arguments module
+==============================================================================================================
+import copy
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+import torch
+
+
+@dataclass
+class Arguments:
+    """Base class for specifying arguments for computing factors and influence scores."""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts the arguments to a dictionary.
+
+        Returns:
+            Dict[str, Any]:
+                A dictionary representation of the arguments, with `torch.dtype` values converted to strings.
+        """
+        config = copy.deepcopy(self.__dict__)
+        for key, value in config.items():
+            if isinstance(value, torch.dtype):
+                config[key] = str(value)
+        return config
+
+    def to_str_dict(self) -> Dict[str, str]:
+        """Converts the arguments to a dictionary with all values as strings.
+
+        Returns:
+            Dict[str, str]:
+                A dictionary representation of the arguments, with all values converted to strings.
+        """
+        config = copy.deepcopy(self.__dict__)
+        for key, value in config.items():
+            config[key] = str(value)
+        return config
+
+
+@dataclass
+class FactorArguments(Arguments):
+    """Arguments for computing influence factors."""
+
+    # General configuration #
+    strategy: str = field(
+        default="ekfac",
+        metadata={"help": "Specifies the algorithm for computing influence factors. Default is 'ekfac'."},
+    )
+    use_empirical_fisher: bool = field(
+        default=False,
+        metadata={
+            "help": "If `True`, approximates empirical Fisher (using true labels) instead of "
+            "true Fisher (using sampled labels from model's outputs)."
+        },
+    )
+    amp_dtype: Optional[torch.dtype] = field(
+        default=None,
+        metadata={"help": "Data type for automatic mixed precision (AMP). If `None`, AMP is disabled."},
+    )
+    amp_scale: float = field(
+        default=2.0**16,
+        metadata={"help": "Scale factor for AMP (only applicable when `amp_dtype=torch.float16`)."},
+    )
+    has_shared_parameters: bool = field(
+        default=False,
+        metadata={"help": "Indicates whether shared parameters are present in the model's forward pass."},
+    )
+
+    # Configuration for fitting covariance matrices. #
+    covariance_max_examples: Optional[int] = field(
+        default=100_000,
+        metadata={"help": "Maximum number of examples for fitting covariance matrices. Uses entire dataset if `None`."},
+    )
+    covariance_data_partitions: int = field(
+        default=1,
+        metadata={"help": "Number of partitions to divide the dataset into for covariance matrix computation."},
+    )
+    covariance_module_partitions: int = field(
+        default=1,
+        metadata={
+            "help": "Number of partitions to divide the model's modules (layers) into for "
+            "covariance matrix computation."
+        },
+    )
+    activation_covariance_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for activation covariance computation."},
+    )
+    gradient_covariance_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for pseudo-gradient covariance computation."},
+    )
+
+    # Configuration for performing eigendecomposition #
+    eigendecomposition_dtype: torch.dtype = field(
+        default=torch.float64,
+        metadata={
+            "help": "Data type for eigendecomposition. Double precision (`torch.float64`) is recommended "
+            "for numerical stability."
+        },
+    )
+
+    # Configuration for fitting Lambda matrices #
+    lambda_max_examples: Optional[int] = field(
+        default=100_000,
+        metadata={"help": "Maximum number of examples for fitting Lambda matrices. Uses entire dataset if `None`."},
+    )
+    lambda_data_partitions: int = field(
+        default=1,
+        metadata={"help": "Number of partitions to divide the dataset into for Lambda matrix computation."},
+    )
+    lambda_module_partitions: int = field(
+        default=1,
+        metadata={
+            "help": "Number of partitions to divide the model's modules (layers) into for Lambda matrix computation."
+        },
+    )
+    use_iterative_lambda_aggregation: bool = field(
+        default=False,
+        metadata={
+            "help": "If `True`, aggregates the squared sum of projected per-sample gradients "
+            "iteratively (with for-loop) to reduce GPU memory usage."
+        },
+    )
+    offload_activations_to_cpu: bool = field(
+        default=False,
+        metadata={"help": "If `True`, offloads cached activations to CPU memory when computing per-sample gradients."},
+    )
+    per_sample_gradient_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for per-sample gradient computation."},
+    )
+    lambda_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for Lambda matrix computation."},
+    )
+
+    def __post_init__(self) -> None:
+        if self.covariance_max_examples is not None and self.covariance_max_examples <= 0:
+            raise ValueError("`covariance_max_examples` must be `None` or positive.")
+
+        if self.lambda_max_examples is not None and self.lambda_max_examples <= 0:
+            raise ValueError("`lambda_max_examples` must be `None` or positive.")
+
+        if any(
+            partition <= 0
+            for partition in [
+                self.covariance_data_partitions,
+                self.covariance_module_partitions,
+                self.lambda_data_partitions,
+                self.lambda_module_partitions,
+            ]
+        ):
+            raise ValueError("All data and module partitions must be positive.")
+
+        # For backward compatibility:
+        if not hasattr(self, "amp_scale"):
+            self.amp_scale = 2.0**16
+
+
+@dataclass
+class ScoreArguments(Arguments):
+    """Arguments for computing influence scores."""
+
+    # General configuration #
+    damping_factor: Optional[float] = field(
+        default=1e-08,
+        metadata={
+            "help": "Damping factor for inverse Hessian-vector product (iHVP). "
+            "If `None`, uses a heuristic of 0.1 times the mean eigenvalue."
+        },
+    )
+    amp_dtype: Optional[torch.dtype] = field(
+        default=None,
+        metadata={"help": "Data type for automatic mixed precision (AMP). If `None`, AMP is disabled."},
+    )
+    offload_activations_to_cpu: bool = field(
+        default=False,
+        metadata={"help": "If `True`, offloads cached activations to CPU memory when computing per-sample gradients."},
+    )
+
+    # Partition configuration #
+    data_partitions: int = field(
+        default=1,
+        metadata={"help": "Number of partitions to divide the dataset for influence score computation."},
+    )
+    module_partitions: int = field(
+        default=1,
+        metadata={
+            "help": "Number of partitions to divide the model's modules (layers) into for influence score computation."
+        },
+    )
+
+    # General score configuration #
+    compute_per_module_scores: bool = field(
+        default=False,
+        metadata={"help": "If `True`, computes separate scores for each module instead of summing across all."},
+    )
+    compute_per_token_scores: bool = field(
+        default=False,
+        metadata={
+            "help": "If `True`, computes separate scores for each token instead of summing across all. "
+            "Only applicable to transformer-based models."
+        },
+    )
+
+    # Pairwise influence score configuration #
+    query_gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={"help": "Number of query batches to accumulate before processing training examples."},
+    )
+    query_gradient_low_rank: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Rank for the low-rank approximation of the query gradient (query batching). "
+            "If `None`, no low-rank approximation is applied."
+        },
+    )
+    use_full_svd: bool = field(
+        default=False,
+        metadata={
+            "help": "If `True`, uses `torch.linalg.svd` instead of `torch.svd_lowrank` for query batching. "
+            "Full SVD is more accurate but slower and more memory-intensive."
+        },
+    )
+    aggregate_query_gradients: bool = field(
+        default=False,
+        metadata={
+            "help": "If `True`, uses the summed query gradient instead of per-sample query gradients "
+            "for pairwise influence computation."
+        },
+    )
+    aggregate_train_gradients: bool = field(
+        default=False,
+        metadata={
+            "help": "If `True`, uses the summed training gradient instead of per-sample training gradients "
+            "for pairwise influence computation."
+        },
+    )
+
+    # Self-influence score configuration #
+    use_measurement_for_self_influence: bool = field(
+        default=False,
+        metadata={"help": "If `True`, uses the measurement (instead of the loss) for computing self-influence scores."},
+    )
+
+    # Precision configuration #
+    query_gradient_svd_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for singular value decomposition (SVD) of query gradient."},
+    )
+    per_sample_gradient_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for query per-sample gradient computation."},
+    )
+    precondition_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for preconditioned gradient computation."},
+    )
+    score_dtype: torch.dtype = field(
+        default=torch.float32,
+        metadata={"help": "Data type for influence score computation."},
+    )
+
+    def __post_init__(self) -> None:
+        if self.damping_factor is not None and self.damping_factor < 0:
+            raise ValueError("`damping_factor` must be `None` or positive.")
+
+        if any(partition <= 0 for partition in [self.data_partitions, self.module_partitions]):
+            raise ValueError("Both data and module partitions must be positive.")
+
+        if self.query_gradient_accumulation_steps <= 0:
+            raise ValueError("`query_gradient_accumulation_steps` must be positive.")
+
+        if self.query_gradient_low_rank is not None and self.query_gradient_low_rank <= 0:
+            raise ValueError("`query_gradient_low_rank` must be `None` or positive.")
+
